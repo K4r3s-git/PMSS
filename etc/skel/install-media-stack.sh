@@ -120,6 +120,10 @@ OVR_JELLYFIN_URL=""
 OVR_JELLYFIN_FFMPEG=""
 JELLYFIN_INSTALL_ENABLED=1
 
+# App selection (menu at start; --apps=LIST skips the menu)
+MEDIA_STACK_APPS=(sonarr radarr prowlarr sabnzbd autobrr jellyfin cloudplow)
+SELECTED_APPS=""
+
 print_usage() {
 	cat <<USAGE
 Usage: install-media-stack.sh [--self-update] [--skip-update] [--dry-run] [overrides]
@@ -145,8 +149,12 @@ Overrides:
   --jellyfin-url=URL          Use exact URL for Jellyfin server tar.gz
   --jellyfin-ffmpeg=PATH      Set Jellyfin EncoderAppPath in encoding.xml to PATH
 
+App selection:
+  --apps=LIST                 Comma-separated apps to install, skips the menu
+                              (${MEDIA_STACK_APPS[*]}, or: all)
+
 Modes:
-  --dry-run                   Verify endpoints and show actions; do not modify system
+  --dry-run                  Verify endpoints and show actions; do not modify system
   --verify-only               Only verify URLs (alias: implies --dry-run) and exit
   --force                     Continue below the ${MEDIA_STACK_MIN_MEMORY_MIB} MiB memory guard
   --start-stopped             Start installed apps whose tmux sessions are absent
@@ -197,6 +205,7 @@ for arg in "$@"; do
 	--sab-version=*) OVR_SAB_VERSION=${arg#*=} ;;
 	--jellyfin-url=*) OVR_JELLYFIN_URL=${arg#*=} ;;
 	--jellyfin-ffmpeg=*) OVR_JELLYFIN_FFMPEG=${arg#*=} ;;
+	--apps=*) SELECTED_APPS=${arg#*=} ;;
 	--self-update) : ;; # handled above (opt-in self-update)
 	--skip-update) : ;; # handled above
 	*) ;;
@@ -691,7 +700,7 @@ jellyfin_ffmpeg_configure_fallback() {
 	log_err "Skipping Jellyfin: FFmpeg ${JELLYFIN_MIN_FFMPEG_VERSION}+ is required for Jellyfin startup."
 	log_err "Install a user-local static FFmpeg at $home_ffmpeg, then rerun:"
 	log_err "  bash install-media-stack.sh --jellyfin-ffmpeg=$home_ffmpeg"
-	log_warn "Continuing with Radarr, Sonarr, Prowlarr, SABnzbd, and Cloudplow."
+	log_warn "Continuing with the other selected apps."
 }
 
 managed_install_path_reset() {
@@ -998,12 +1007,15 @@ url.redirect += (
 EOF
 		for proxy in "sabnzbd|$SABNZBD_PORT" "radarr|$RADARR_PORT" "prowlarr|$PROWLARR_PORT" "sonarr|$SONARR_PORT"; do
 			IFS='|' read -r app port <<<"$proxy"
-			[[ "$app" == "sabnzbd" ]] || echo ""
+			app_active "$app" || continue
+			echo ""
 			lighttpd_media_stack_proxy_block_write "$app" "$port"
 		done
-		echo ""
-		lighttpd_media_stack_proxy_block_write "autobrr" "$AUTOBRR_PORT"
-		if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
+		if app_active autobrr; then
+			echo ""
+			lighttpd_media_stack_proxy_block_write "autobrr" "$AUTOBRR_PORT"
+		fi
+		if app_active jellyfin; then
 			echo ""
 			lighttpd_media_stack_proxy_block_write "jellyfin" "$JELLYFIN_PORT"
 		fi
@@ -1333,12 +1345,253 @@ JELLYFIN_MIN_FFMPEG_VERSION="4.4"
 # Determine public IP from default route (no external HTTP request needed)
 PUBLIC_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || echo "unavailable")
 
+# Returns 1 for an unselected app on purpose (a predicate, not a step).
+app_selected() {
+	if [[ " $SELECTED_APPS " == *" $1 "* ]]; then
+		return 0
+	fi
+	return 1
+}
+
+media_stack_app_bin_dir() {
+	case "$1" in
+	sonarr | radarr | prowlarr) printf '%s' "$HOME/.bin/${1^}" ;;
+	*) printf '%s' "$HOME/.bin/$1" ;;
+	esac
+}
+
+# Selected now, or already installed from an earlier run (keeps proxy/credentials for it)
+app_active() {
+	if [[ "$1" == jellyfin ]]; then
+		[[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]] && return 0
+	else
+		app_selected "$1" && return 0
+	fi
+	if [[ -d "$(media_stack_app_bin_dir "$1")" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+media_stack_selection_validate() {
+	local app
+	SELECTED_APPS="${SELECTED_APPS//,/ }"
+	[[ "$SELECTED_APPS" == "all" ]] && return 0
+	for app in $SELECTED_APPS; do
+		[[ " ${MEDIA_STACK_APPS[*]} " == *" $app "* ]] || {
+			log_err "Unknown app: $app (valid: ${MEDIA_STACK_APPS[*]})"
+			exit 1
+		}
+	done
+}
+
+media_stack_needs_dotnet() {
+	app_selected sonarr || app_selected radarr || app_selected prowlarr || [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]
+}
+
+media_stack_select_apps() {
+	local choice n app i
+	while true; do
+		echo ""
+		echo "Which apps do you want to install? (multiple choice)"
+		for i in "${!MEDIA_STACK_APPS[@]}"; do
+			echo "  $((i + 1))) ${MEDIA_STACK_APPS[$i]}"
+		done
+		echo "  a) all"
+		read -r -p "Selection (e.g. 1 3 5, Enter = all): " choice || choice=""
+		SELECTED_APPS=""
+		[[ -z "$choice" || "$choice" == [aA] ]] && SELECTED_APPS="${MEDIA_STACK_APPS[*]}" && return 0
+		for n in ${choice//,/ }; do
+			if [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#MEDIA_STACK_APPS[@]})); then
+				app="${MEDIA_STACK_APPS[$((n - 1))]}"
+				app_selected "$app" || SELECTED_APPS="${SELECTED_APPS:+$SELECTED_APPS }$app"
+			else
+				log_warn "Invalid choice: $n"
+				SELECTED_APPS=""
+				break
+			fi
+		done
+		[[ -n "$SELECTED_APPS" ]] && return 0
+	done
+}
+
+media_stack_lighttpd_restart() {
+	local username
+	username=$(whoami)
+	log_step "Restarting lighttpd"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		pkill -9 -u "$username" lighttpd >/dev/null 2>&1 || true
+		pkill -9 -u "$username" php-cgi >/dev/null 2>&1 || true
+		if command -v lighttpd >/dev/null 2>&1 && [[ -f "$HOME/.lighttpd.conf" ]]; then
+			if ! lighttpd -f "$HOME/.lighttpd.conf" >/dev/null 2>&1; then
+				log_warn "Direct lighttpd restart failed; watchdog may retry."
+			fi
+		else
+			echo "It may take 1-2 minutes to restart lighttpd"
+		fi
+	else
+		log_info "[dry-run] would restart lighttpd/php-cgi"
+	fi
+}
+
+# An app counts as installed while its program or config directory exists.
+media_stack_installed_apps() {
+	local app
+	for app in "${MEDIA_STACK_APPS[@]}"; do
+		if [[ -d "$(media_stack_app_bin_dir "$app")" || -d "$HOME/.config/$app" ]]; then
+			printf '%s\n' "$app"
+		fi
+	done
+	return 0
+}
+
+media_stack_select_uninstall_apps() {
+	local -a installed
+	local choice n i
+	mapfile -t installed < <(media_stack_installed_apps)
+	if [[ ${#installed[@]} -eq 0 ]]; then
+		log_info "No media stack apps installed; nothing to uninstall."
+		exit 0
+	fi
+	while true; do
+		echo ""
+		echo "Installed apps - which do you want to uninstall? (multiple choice)"
+		for i in "${!installed[@]}"; do
+			echo "  $((i + 1))) ${installed[$i]}"
+		done
+		echo "  a) all (full PMSS media stack uninstall)"
+		# No terminal (web panel, pipe): keep the old --uninstall behaviour and remove everything.
+		if ! read -r -p "Selection (e.g. 1 3, Enter = cancel): " choice; then
+			SELECTED_APPS="all"
+			return 0
+		fi
+		if [[ -z "$choice" ]]; then
+			log_info "Uninstall cancelled."
+			exit 0
+		fi
+		if [[ "$choice" == [aA] ]]; then
+			SELECTED_APPS="all"
+			return 0
+		fi
+		SELECTED_APPS=""
+		for n in ${choice//,/ }; do
+			if [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#installed[@]})); then
+				app_selected "${installed[$((n - 1))]}" || SELECTED_APPS="${SELECTED_APPS:+$SELECTED_APPS }${installed[$((n - 1))]}"
+			else
+				log_warn "Invalid choice: $n"
+				SELECTED_APPS=""
+				break
+			fi
+		done
+		[[ -n "$SELECTED_APPS" ]] && return 0
+	done
+}
+
+
+# Drop one app's proxy block from the managed lighttpd fragment.
+lighttpd_media_stack_proxy_block_remove() {
+	local app="$1" conf="$HOME/.lighttpd/custom.d/media-stack.conf"
+	[[ -f "$conf" ]] || return 0
+	awk -v start="\$HTTP[\"url\"] =~ \"^/${app}(" '
+		index($0, start) == 1 { skip = 1; next }
+		skip { if ($0 == "}") skip = 0; next }
+		{ print }
+	' "$conf" >"$conf.pmss.$$" && mv "$conf.pmss.$$" "$conf"
+	chmod 640 "$conf" 2>/dev/null || true
+}
+
+# Stop one app without pattern matching: a -f pattern also matches the installer's own
+# command line (--apps=<app>) and the shared tmux server, whose argv holds the command of
+# whichever session started first. Read the pane PID, drop the session, then end that
+# process group.
+media_stack_app_stop() {
+	local app="$1" pane_pid
+	media_stack_session_owned "$app" || return 0
+	pane_pid=$(tmux list-panes -t "=$app" -F '#{pane_pid}' 2>/dev/null | head -n 1 || true)
+	media_stack_session_kill_owned "$app"
+	[[ "$pane_pid" =~ ^[0-9]+$ && "$pane_pid" -gt 1 && "$pane_pid" != "$$" && "$pane_pid" != "$BASHPID" ]] || return 0
+	kill -TERM -- "-$pane_pid" 2>/dev/null || kill -TERM "$pane_pid" 2>/dev/null || true
+	sleep 1
+	kill -KILL -- "-$pane_pid" 2>/dev/null || kill -KILL "$pane_pid" 2>/dev/null || true
+}
+
+# Uninstall only the selected apps; the full uninstall (all) stays media_stack_uninstall.
+media_stack_uninstall_apps() {
+	local app
+	log_step "Uninstalling: $SELECTED_APPS"
+	for app in $SELECTED_APPS; do
+		if [[ $DRY_RUN -eq 0 ]]; then
+			media_stack_app_stop "$app"
+			lighttpd_media_stack_proxy_block_remove "$app"
+			[[ -f "$MEDIA_STACK_CREDENTIALS_FILE" ]] && sed -i "/^${app^^}_/d" "$MEDIA_STACK_CREDENTIALS_FILE"
+		else
+			log_info "[dry-run] would stop $app, drop its proxy route and credentials"
+		fi
+		media_stack_managed_path_remove "$(media_stack_app_bin_dir "$app")"
+		media_stack_managed_path_remove "$HOME/.config/$app"
+		log_ok "$app removed"
+	done
+	# The shared .NET runtime is only needed while a .NET app remains.
+	if [[ -d "$HOME/.bin/dotnet" && ! -d "$HOME/.bin/Sonarr" && ! -d "$HOME/.bin/Radarr" && ! -d "$HOME/.bin/Prowlarr" && ! -d "$HOME/.bin/jellyfin" ]]; then
+		log_info "No .NET app left; removing shared .NET runtime"
+		media_stack_managed_path_remove "$HOME/.bin/dotnet"
+	fi
+	media_stack_lighttpd_restart
+	log_ok "Uninstall complete."
+}
+
+# Menus only when a person is at a terminal. Without one (web panel, cron, wget|bash where
+# stdin carries the script itself) the original defaults apply: install all, full uninstall.
+MEDIA_STACK_INTERACTIVE=0
+[[ -t 0 ]] && MEDIA_STACK_INTERACTIVE=1
+
+if [[ $MEDIA_STACK_INTERACTIVE -eq 1 && -z "$SECURE_APP" && $UNINSTALL -eq 0 && -z "$SELECTED_APPS" ]]; then
+	echo ""
+	echo "What do you want to do?"
+	echo "  i) install / update apps"
+	echo "  u) uninstall apps"
+	read -r -p "Choice (Enter = install): " mode_choice || mode_choice=""
+	[[ "$mode_choice" == [uU] ]] && UNINSTALL=1
+fi
+
 if [[ $UNINSTALL -eq 1 ]]; then
-	media_stack_uninstall
+	if [[ -z "$SELECTED_APPS" ]]; then
+		if [[ $MEDIA_STACK_INTERACTIVE -eq 1 ]]; then
+			media_stack_select_uninstall_apps
+		else
+			SELECTED_APPS="all"
+		fi
+	fi
+	media_stack_selection_validate
+	if [[ $DRY_RUN -eq 0 && $MEDIA_STACK_INTERACTIVE -eq 1 ]]; then
+		read -r -p "Remove ${SELECTED_APPS} including config and data? (y/N): " confirm || confirm="y"
+		if [[ "$confirm" != [yY] ]]; then
+			log_info "Uninstall cancelled."
+			exit 0
+		fi
+	fi
+	if [[ "$SELECTED_APPS" == "all" ]]; then
+		media_stack_uninstall
+	else
+		media_stack_uninstall_apps
+	fi
 	exit 0
 fi
 
 if [[ -z "$SECURE_APP" ]]; then
+	if [[ -z "$SELECTED_APPS" ]]; then
+		if [[ $MEDIA_STACK_INTERACTIVE -eq 1 ]]; then
+			media_stack_select_apps
+		else
+			SELECTED_APPS="all"
+		fi
+	fi
+	media_stack_selection_validate
+	[[ "$SELECTED_APPS" == "all" ]] && SELECTED_APPS="${MEDIA_STACK_APPS[*]}"
+	app_selected jellyfin || JELLYFIN_INSTALL_ENABLED=0
+	log_ok "Selected apps: $SELECTED_APPS"
+	echo ""
+
 	# Check required dependencies early
 	log_step "Checking dependencies..."
 	MISSING_CMDS=()
@@ -1388,7 +1641,9 @@ if [[ -z "$SECURE_APP" ]]; then
 		;;
 	esac
 
-	jellyfin_ffmpeg_configure_fallback
+	if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
+		jellyfin_ffmpeg_configure_fallback
+	fi
 
 	# Preserve unrelated ~/.bin contents on reruns; only managed media-stack paths are refreshed.
 	if [ -d "$HOME/.bin" ] && [ "$(ls -A "$HOME/.bin" 2>/dev/null)" ]; then
@@ -1412,23 +1667,25 @@ if [[ -z "$SECURE_APP" ]]; then
 		log_warn "Leaving existing Jellyfin config untouched because this run will skip Jellyfin."
 	fi
 
+	config_dirs=()
+	for app in $SELECTED_APPS; do
+		[[ "$app" == jellyfin && "$JELLYFIN_INSTALL_ENABLED" -eq 0 ]] || config_dirs+=("$HOME/.config/$app")
+	done
 	if [[ $DRY_RUN -eq 0 ]]; then
-		config_dirs=("$HOME"/.config/{radarr,sonarr,prowlarr,sabnzbd,cloudplow,autobrr})
-		[[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]] && config_dirs+=("$HOME/.config/jellyfin")
-		mkdir -p "${config_dirs[@]}"
-		chmod 700 "${config_dirs[@]}"
+		[[ ${#config_dirs[@]} -gt 0 ]] && mkdir -p "${config_dirs[@]}" && chmod 700 "${config_dirs[@]}"
 		mkdir -p "$HOME/.bin"
 	else
-		config_dir_label="radarr,sonarr,prowlarr,sabnzbd,cloudplow,autobrr"
-		[[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]] && config_dir_label="radarr,sonarr,prowlarr,jellyfin,sabnzbd,cloudplow,autobrr"
-		log_info "[dry-run] would create ~/.config/{${config_dir_label}}"
+		log_info "[dry-run] would create ${config_dirs[*]}"
 		log_info "[dry-run] would create ~/.bin"
 	fi
 
 	log_step "Resolving latest versions..."
 
 	# SABnzbd (GitHub API)
-	if [[ -n "$OVR_SAB_URL" ]]; then
+	if ! app_selected sabnzbd; then
+		SABNZBD_URL=""
+		SABNZBD_VERSION="skipped"
+	elif [[ -n "$OVR_SAB_URL" ]]; then
 		SABNZBD_URL="$OVR_SAB_URL"
 		SABNZBD_VERSION="override"
 	else
@@ -1444,7 +1701,11 @@ if [[ -z "$SECURE_APP" ]]; then
 	fi
 
 	# Autobrr (GitHub API, latest release asset for the detected architecture)
-	autobrr_resolve_download_url
+	if app_selected autobrr; then
+		autobrr_resolve_download_url
+	else
+		AUTOBRR_VERSION="skipped"
+	fi
 
 	# Jellyfin (Repo Scraping)
 	# Fetches from repo.jellyfin.org structure: files/server/linux/latest-stable/<arch>/
@@ -1470,7 +1731,8 @@ if [[ -z "$SECURE_APP" ]]; then
 
 	# ASP.NET Core Runtime (Microsoft aka.ms Links)
 	# These redirect to the latest patch version of .NET 8 (LTS)
-	ASPDOTNET_URL="https://aka.ms/dotnet/8.0/aspnetcore-runtime-linux-${DOTNET_ARCH}.tar.gz"
+	ASPDOTNET_URL=""
+	media_stack_needs_dotnet && ASPDOTNET_URL="https://aka.ms/dotnet/8.0/aspnetcore-runtime-linux-${DOTNET_ARCH}.tar.gz"
 
 	log_info "SABnzbd: ${SABNZBD_VERSION:-unknown}"
 	log_info "Autobrr: ${AUTOBRR_VERSION:-unknown}"
@@ -1656,22 +1918,32 @@ media_stack_credentials_file_write() {
 	{
 		printf '# PMSS media stack credentials\n'
 		printf '# This file is owner-readable only; app auth is separate from the public proxy.\n'
-		printf 'SABNZBD_URL = https://%s/public-%s/sabnzbd/\n' "$HOSTNAME" "$USERNAME"
-		printf 'SABNZBD_USERNAME = %s\n' "$SABNZBD_AUTH_USERNAME"
-		printf 'SABNZBD_PASSWORD = %s\n' "$SABNZBD_PASSWORD"
-		printf 'RADARR_URL = https://%s/public-%s/radarr/\n' "$HOSTNAME" "$USERNAME"
-		printf 'RADARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
-		printf 'RADARR_PASSWORD = %s\n' "$RADARR_PASSWORD"
-		printf 'SONARR_URL = https://%s/public-%s/sonarr/\n' "$HOSTNAME" "$USERNAME"
-		printf 'SONARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
-		printf 'SONARR_PASSWORD = %s\n' "$SONARR_PASSWORD"
-		printf 'PROWLARR_URL = https://%s/public-%s/prowlarr/\n' "$HOSTNAME" "$USERNAME"
-		printf 'PROWLARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
-		printf 'PROWLARR_PASSWORD = %s\n' "$PROWLARR_PASSWORD"
-		printf 'AUTOBRR_URL = https://%s/public-%s/autobrr/\n' "$HOSTNAME" "$USERNAME"
-		printf 'AUTOBRR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
-		printf 'AUTOBRR_PASSWORD = %s\n' "$AUTOBRR_PASSWORD"
-		if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
+		if app_active sabnzbd; then
+			printf 'SABNZBD_URL = https://%s/public-%s/sabnzbd/\n' "$HOSTNAME" "$USERNAME"
+			printf 'SABNZBD_USERNAME = %s\n' "$SABNZBD_AUTH_USERNAME"
+			printf 'SABNZBD_PASSWORD = %s\n' "$SABNZBD_PASSWORD"
+		fi
+		if app_active radarr; then
+			printf 'RADARR_URL = https://%s/public-%s/radarr/\n' "$HOSTNAME" "$USERNAME"
+			printf 'RADARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
+			printf 'RADARR_PASSWORD = %s\n' "$RADARR_PASSWORD"
+		fi
+		if app_active sonarr; then
+			printf 'SONARR_URL = https://%s/public-%s/sonarr/\n' "$HOSTNAME" "$USERNAME"
+			printf 'SONARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
+			printf 'SONARR_PASSWORD = %s\n' "$SONARR_PASSWORD"
+		fi
+		if app_active prowlarr; then
+			printf 'PROWLARR_URL = https://%s/public-%s/prowlarr/\n' "$HOSTNAME" "$USERNAME"
+			printf 'PROWLARR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
+			printf 'PROWLARR_PASSWORD = %s\n' "$PROWLARR_PASSWORD"
+		fi
+		if app_active autobrr; then
+			printf 'AUTOBRR_URL = https://%s/public-%s/autobrr/\n' "$HOSTNAME" "$USERNAME"
+			printf 'AUTOBRR_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
+			printf 'AUTOBRR_PASSWORD = %s\n' "$AUTOBRR_PASSWORD"
+		fi
+		if app_active jellyfin; then
 			printf 'JELLYFIN_URL = https://%s/public-%s/jellyfin/web/\n' "$HOSTNAME" "$USERNAME"
 			printf 'JELLYFIN_USERNAME = %s\n' "$MEDIA_STACK_AUTH_USERNAME"
 			printf 'JELLYFIN_PASSWORD = %s\n' "$JELLYFIN_PASSWORD"
@@ -1973,6 +2245,12 @@ jellyfin_auth_seed() {
 		media_stack_auth_seed_cleanup "$session" "$payload_json" "$auth_json"
 		return 1
 	fi
+	if ! base_url=$(jellyfin_startup_base_url "$base_url" "$JELLYFIN_CONFIG_DIR" 120); then
+		log_err "Jellyfin startup API never answered HTTP 200, with or without BaseUrl (see $JELLYFIN_LOG_DIR/jellyfin-auth-seed.log)"
+		tmux kill-session -t "$session" 2>/dev/null || true
+		rm -f "$payload_json" "$auth_json"
+		return 1
+	fi
 
 	if ! curl -fsS --max-time 10 "${base_url}/Startup/User" >/dev/null; then
 		log_err "Jellyfin startup user initialization failed"
@@ -2035,8 +2313,12 @@ jellyfin_encoding_ffmpeg_set() {
 }
 
 media_stack_sessions() {
+	local app
 	[[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]] && printf '%s\n' jellyfin
-	printf '%s\n' "$@"
+	for app in "$@"; do
+		app_selected "$app" && printf '%s\n' "$app"
+	done
+	return 0
 }
 
 media_stack_sessions_label() {
@@ -2074,33 +2356,33 @@ media_stack_start_servarr_app() {
 
 media_stack_start_apps() {
 	# Point service commands to the dotnet binary, not the runtime directory.
-	if [[ ! -f "$DOTNET_ROOT_PATH/dotnet" ]]; then
+	if media_stack_needs_dotnet && [[ ! -f "$DOTNET_ROOT_PATH/dotnet" ]]; then
 		log_err "dotnet binary not found at $DOTNET_ROOT_PATH/dotnet"
 		exit 1
 	fi
 
-	mkdir -p "$HOME/.config/sonarr" "$HOME/.config/radarr" "$HOME/.config/prowlarr" "$HOME/.config/sabnzbd" "$HOME/.config/autobrr"
 	if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
 		mkdir -p "$JELLYFIN_DATA_DIR/log"
 		media_stack_start_tmux_app "jellyfin" "$HOME/.bin/jellyfin/jellyfin.dll" \
 			"export DOTNET_ROOT=\"$DOTNET_ROOT_PATH\"; export JELLYFIN_CONFIG_DIR=\"$JELLYFIN_CONFIG_DIR\"; export JELLYFIN_DATA_DIR=\"$JELLYFIN_DATA_DIR\"; export JELLYFIN_LOG_DIR=\"$JELLYFIN_LOG_DIR\"; export ASPNETCORE_URLS=\"http://127.0.0.1:${JELLYFIN_PORT}\"; cd \"$HOME/.bin/jellyfin\" && ionice -c 2 -n 4 nice -n 19 \"$DOTNET_ROOT_PATH/dotnet\" jellyfin.dll 2>&1 | tee -a \"$JELLYFIN_LOG_DIR/jellyfin.log\"" \
 			"Jellyfin DLL not found at $HOME/.bin/jellyfin/jellyfin.dll"
-	else
+	elif app_selected jellyfin; then
 		log_warn "Skipping Jellyfin start; FFmpeg ${JELLYFIN_MIN_FFMPEG_VERSION}+ is not configured"
 	fi
 
-	media_stack_start_servarr_app "sonarr" "Sonarr" "Sonarr.dll" ""
-	media_stack_start_servarr_app "radarr" "Radarr" "Radarr.dll" "--nobrowser"
-	media_stack_start_servarr_app "prowlarr" "Prowlarr" "Prowlarr.dll" "--nobrowser"
-	media_stack_start_tmux_app "sabnzbd" "$HOME/.bin/sabnzbd/sabnzbd/SABnzbd.py" \
+	app_selected sonarr && media_stack_start_servarr_app "sonarr" "Sonarr" "Sonarr.dll" ""
+	app_selected radarr && media_stack_start_servarr_app "radarr" "Radarr" "Radarr.dll" "--nobrowser"
+	app_selected prowlarr && media_stack_start_servarr_app "prowlarr" "Prowlarr" "Prowlarr.dll" "--nobrowser"
+	app_selected sabnzbd && media_stack_start_tmux_app "sabnzbd" "$HOME/.bin/sabnzbd/sabnzbd/SABnzbd.py" \
 		"source $HOME/.bin/sabnzbd/bin/activate && cd \"$HOME/.bin/sabnzbd/sabnzbd\" && nice -n 19 python3 SABnzbd.py -b 0 -f $HOME/.config/sabnzbd/sabnzbd.ini 2>&1 | tee -a \"$HOME/.config/sabnzbd/sabnzbd.log\"" \
 		"SABnzbd not found at $HOME/.bin/sabnzbd/sabnzbd/SABnzbd.py"
-	media_stack_start_tmux_app "cloudplow" "$HOME/.bin/cloudplow/cloudplow/cloudplow.py" \
+	app_selected cloudplow && media_stack_start_tmux_app "cloudplow" "$HOME/.bin/cloudplow/cloudplow/cloudplow.py" \
 		"source $HOME/.bin/cloudplow/bin/activate && python3 $HOME/.bin/cloudplow/cloudplow/cloudplow.py run --config=$HOME/.config/cloudplow/config.json --loglevel=DEBUG --cachefile=$HOME/.config/cloudplow/cache.db --logfile=$HOME/.config/cloudplow/cloudplow.log" \
 		"Cloudplow not found at $HOME/.bin/cloudplow/cloudplow/cloudplow.py"
-	media_stack_start_tmux_app "autobrr" "$HOME/.bin/autobrr/autobrr" \
+	app_selected autobrr && media_stack_start_tmux_app "autobrr" "$HOME/.bin/autobrr/autobrr" \
 		"AUTOBRR__HOST=127.0.0.1 AUTOBRR__PORT=\"$AUTOBRR_PORT\" AUTOBRR__BASE_URL=$AUTOBRR_BASE_URL AUTOBRR__BASE_URL_MODE_LEGACY=false \"$HOME/.bin/autobrr/autobrr\" --config=\"$HOME/.config/autobrr\" 2>&1 | tee -a \"$HOME/.config/autobrr/autobrr.log\"" \
 		"Autobrr not found at $HOME/.bin/autobrr/autobrr"
+	return 0
 }
 
 media_stack_verify_sessions() {
@@ -2396,54 +2678,57 @@ if [[ $DRY_RUN -eq 0 ]]; then
 	done < <(media_stack_sessions "${MEDIA_STACK_STOP_SESSIONS[@]}")
 fi
 
-# Install Cloudplow (unchanged, repo active)
-app="cloudplow"
-log_step "Installing ${app^^}..."
-installdir="$HOME/.bin/cloudplow"
-datadir="$HOME/.config/cloudplow"
-mkdir -p "$datadir"
-if [[ $DRY_RUN -eq 0 ]]; then
-	managed_install_path_reset "$installdir"
-	python3 -m venv "$installdir"
-	cd "$installdir"
-	git clone https://github.com/l3uddz/cloudplow.git >/dev/null
-	cd "${installdir}/cloudplow" && git checkout "$CLOUDPLOW_COMMIT" >/dev/null 2>&1
-	cd "$installdir"
-	python_venv_install_requirements "$installdir" "${installdir}/cloudplow/requirements.txt"
-	echo "${app^^} Installed"
-else
-	log_info "[dry-run] would install Cloudplow via git clone and venv"
+if app_selected cloudplow; then
+	# Install Cloudplow (unchanged, repo active)
+	app="cloudplow"
+	log_step "Installing ${app^^}..."
+	installdir="$HOME/.bin/cloudplow"
+	datadir="$HOME/.config/cloudplow"
+	mkdir -p "$datadir"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		managed_install_path_reset "$installdir"
+		python3 -m venv "$installdir"
+		cd "$installdir"
+		git clone https://github.com/l3uddz/cloudplow.git >/dev/null
+		cd "${installdir}/cloudplow" && git checkout "$CLOUDPLOW_COMMIT" >/dev/null 2>&1
+		cd "$installdir"
+		python_venv_install_requirements "$installdir" "${installdir}/cloudplow/requirements.txt"
+		echo "${app^^} Installed"
+	else
+		log_info "[dry-run] would install Cloudplow via git clone and venv"
+	fi
 fi
 echo ""
 
-# Install SABnzbd (minor updates)
-app="sabnzbd"
-log_step "Installing ${app^^}..."
-installdir="$HOME/.bin/sabnzbd"
-datadir="$HOME/.config/sabnzbd"
-mkdir -p "$datadir"
-media_stack_app_processes_kill "${app}"
-if [[ $DRY_RUN -eq 0 ]]; then
-	managed_install_path_reset "$installdir"
-	python3 -m venv "$installdir"
-	cd "$installdir"
-	echo "Downloading...${app^^} (${SABNZBD_VERSION})"
-	if [[ -z "${SABNZBD_URL:-}" ]]; then
-		log_err "SABnzbd URL not resolved"
-		exit 1
+if app_selected sabnzbd; then
+	# Install SABnzbd (minor updates)
+	app="sabnzbd"
+	log_step "Installing ${app^^}..."
+	installdir="$HOME/.bin/sabnzbd"
+	datadir="$HOME/.config/sabnzbd"
+	mkdir -p "$datadir"
+	media_stack_app_processes_kill "${app}"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		managed_install_path_reset "$installdir"
+		python3 -m venv "$installdir"
+		cd "$installdir"
+		echo "Downloading...${app^^} (${SABNZBD_VERSION})"
+		if [[ -z "${SABNZBD_URL:-}" ]]; then
+			log_err "SABnzbd URL not resolved"
+			exit 1
+		fi
+		fetch_verified_archive "$SABNZBD_URL" "${app}.tar.gz" "SABnzbd"
+		mkdir -p "${app}"
+		extract_tgz "${app}.tar.gz" "${app}" 1
+		python_venv_install_requirements "$installdir" "${installdir}/${app}/requirements.txt"
+		echo "${app^^} Installed"
+	else
+		log_info "[dry-run] would create SABnzbd venv and install requirements"
 	fi
-	fetch_verified_archive "$SABNZBD_URL" "${app}.tar.gz" "SABnzbd"
-	mkdir -p "${app}"
-	extract_tgz "${app}.tar.gz" "${app}" 1
-	python_venv_install_requirements "$installdir" "${installdir}/${app}/requirements.txt"
-	echo "${app^^} Installed"
-else
-	log_info "[dry-run] would create SABnzbd venv and install requirements"
-fi
-echo "Configuring ${app^^}"
-if [[ $DRY_RUN -eq 0 ]]; then
-	if [ ! -f "$datadir/${app}.ini" ]; then
-		cat <<EOF >"$datadir/${app}.ini"
+	echo "Configuring ${app^^}"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		if [ ! -f "$datadir/${app}.ini" ]; then
+			cat <<EOF >"$datadir/${app}.ini"
 [misc]
 port = 8080
 host = 127.0.0.1
@@ -2451,25 +2736,26 @@ url_base = /sabnzbd
 host_whitelist = ${HOSTNAME}
 inet_exposure = 4
 EOF
+		fi
+		sabnzbd_misc_value_set "$datadir/${app}.ini" url_base "/public-${USERNAME}/${app}"
+		sabnzbd_misc_value_set "$datadir/${app}.ini" port "$SABNZBD_PORT"
+		sabnzbd_misc_value_set "$datadir/${app}.ini" host "127.0.0.1"
+		sabnzbd_misc_value_set "$datadir/${app}.ini" host_whitelist "$HOSTNAME"
+		sabnzbd_misc_value_set "$datadir/${app}.ini" username "$SABNZBD_AUTH_USERNAME"
+		sabnzbd_misc_value_set "$datadir/${app}.ini" password "$SABNZBD_PASSWORD"
+		# The public lighttpd proxy forwards real client IPs; keep the proxied WebUI/wizard reachable.
+		sabnzbd_misc_value_set "$datadir/${app}.ini" inet_exposure "4"
+		if [[ "$(existing_value_from_ini "$datadir/${app}.ini" "username")" != "$SABNZBD_AUTH_USERNAME" ||
+		"$(existing_value_from_ini "$datadir/${app}.ini" "password")" != "$SABNZBD_PASSWORD" ||
+		"$(existing_value_from_ini "$datadir/${app}.ini" "inet_exposure")" != "4" ]]; then
+			log_err "SABnzbd auth configuration verification failed"
+			exit 1
+		fi
+	else
+		log_info "[dry-run] would configure ${app^^} (port=${SABNZBD_PORT}, url_base=/public-${USERNAME}/${app})"
 	fi
-	sabnzbd_misc_value_set "$datadir/${app}.ini" url_base "/public-${USERNAME}/${app}"
-	sabnzbd_misc_value_set "$datadir/${app}.ini" port "$SABNZBD_PORT"
-	sabnzbd_misc_value_set "$datadir/${app}.ini" host "127.0.0.1"
-	sabnzbd_misc_value_set "$datadir/${app}.ini" host_whitelist "$HOSTNAME"
-	sabnzbd_misc_value_set "$datadir/${app}.ini" username "$SABNZBD_AUTH_USERNAME"
-	sabnzbd_misc_value_set "$datadir/${app}.ini" password "$SABNZBD_PASSWORD"
-	# The public lighttpd proxy forwards real client IPs; keep the proxied WebUI/wizard reachable.
-	sabnzbd_misc_value_set "$datadir/${app}.ini" inet_exposure "4"
-	if [[ "$(existing_value_from_ini "$datadir/${app}.ini" "username")" != "$SABNZBD_AUTH_USERNAME" ||
-	"$(existing_value_from_ini "$datadir/${app}.ini" "password")" != "$SABNZBD_PASSWORD" ||
-	"$(existing_value_from_ini "$datadir/${app}.ini" "inet_exposure")" != "4" ]]; then
-		log_err "SABnzbd auth configuration verification failed"
-		exit 1
-	fi
-else
-	log_info "[dry-run] would configure ${app^^} (port=${SABNZBD_PORT}, url_base=/public-${USERNAME}/${app})"
+	echo "${app^^} configured"
 fi
-echo "${app^^} configured"
 echo ""
 
 for servarr_spec in \
@@ -2477,61 +2763,69 @@ for servarr_spec in \
 	"prowlarr|Prowlarr|$HOME/.config/prowlarr|$PROWLARR_PORT|9696|log_step" \
 	"sonarr|Sonarr|$HOME/.config/sonarr|$SONARR_PORT|8989|log_step"; do
 	IFS='|' read -r app install_name datadir port default_port step_logger <<<"$servarr_spec"
+	app_selected "$app" || continue
 	"$step_logger" "Installing ${app^^}..."
 	servarr_resolve_download_url "$app"
 	servarr_install_from_url "$app" "$install_name" "$datadir" "$port" "$default_port" "$SERVARR_DOWNLOAD_URL"
 done
 
-# Install Autobrr as a user-local single binary and keep its proxy settings in
-# the user config while runtime environment variables enforce loopback binding.
-app="autobrr"
-log_step "Installing ${app^^}..."
-installdir="$HOME/.bin/autobrr"
-datadir="$HOME/.config/autobrr"
-mkdir -p "$datadir"
-media_stack_app_processes_kill "$app"
-if [[ $DRY_RUN -eq 0 ]]; then
-	managed_install_path_reset "$installdir"
-	mkdir -p "$installdir"
-	cd "$installdir"
-	echo "Downloading...${app^^} (${AUTOBRR_VERSION:-unknown})"
-	if [[ -z "${AUTOBRR_URL:-}" ]]; then
-		log_err "Autobrr URL not resolved"
-		exit 1
+if app_selected autobrr; then
+	# Install Autobrr as a user-local single binary and keep its proxy settings in
+	# the user config while runtime environment variables enforce loopback binding.
+	app="autobrr"
+	log_step "Installing ${app^^}..."
+	installdir="$HOME/.bin/autobrr"
+	datadir="$HOME/.config/autobrr"
+	mkdir -p "$datadir"
+	media_stack_app_processes_kill "$app"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		managed_install_path_reset "$installdir"
+		mkdir -p "$installdir"
+		cd "$installdir"
+		echo "Downloading...${app^^} (${AUTOBRR_VERSION:-unknown})"
+		if [[ -z "${AUTOBRR_URL:-}" ]]; then
+			log_err "Autobrr URL not resolved"
+			exit 1
+		fi
+		fetch_verified_archive "$AUTOBRR_URL" "autobrr.tar.gz" "Autobrr"
+		extract_tgz "autobrr.tar.gz" "$installdir"
+		autobrr_configure "$datadir/config.toml" "$AUTOBRR_PORT" "$AUTOBRR_SESSION_SECRET"
+		chmod 700 "$installdir/autobrr" "$installdir/autobrrctl" 2>/dev/null || true
+		if ! autobrr_auth_seed "$datadir" "$AUTOBRR_PASSWORD" "$AUTOBRR_PORT"; then
+			log_err "Autobrr auth seeding failed; not starting media stack"
+			exit 1
+		fi
+		echo "${app^^} Installed"
+	else
+		log_info "[dry-run] would install Autobrr ${AUTOBRR_VERSION:-unknown} and configure loopback port ${AUTOBRR_PORT}"
 	fi
-	fetch_verified_archive "$AUTOBRR_URL" "autobrr.tar.gz" "Autobrr"
-	extract_tgz "autobrr.tar.gz" "$installdir"
-	autobrr_configure "$datadir/config.toml" "$AUTOBRR_PORT" "$AUTOBRR_SESSION_SECRET"
-	chmod 700 "$installdir/autobrr" "$installdir/autobrrctl" 2>/dev/null || true
-	if ! autobrr_auth_seed "$datadir" "$AUTOBRR_PASSWORD" "$AUTOBRR_PORT"; then
-		log_err "Autobrr auth seeding failed; not starting media stack"
-		exit 1
-	fi
-	echo "${app^^} Installed"
-else
-	log_info "[dry-run] would install Autobrr ${AUTOBRR_VERSION:-unknown} and configure loopback port ${AUTOBRR_PORT}"
 fi
 echo ""
 
-# Install ASP.NET Core (.NET 8)
-app="aspnetcore"
-log_step "Installing ${app^^}..."
-echo "Downloading...${app^^}"
-installdir="$HOME/.bin/dotnet"
-managed_install_path_reset "$installdir"
-mkdir -p "$installdir"
-cd "$installdir"
-fetch_verified_archive "$ASPDOTNET_URL" "aspnetcore.tar.gz" "ASP.NET runtime"
-if [[ $DRY_RUN -eq 0 && ! -f "aspnetcore.tar.gz" ]]; then
-	log_err "Failed to find downloaded ASP.NET archive"
-	exit 1
-fi
-extract_tgz "aspnetcore.tar.gz" "$installdir"
-if [[ $DRY_RUN -eq 0 ]]; then
-	echo "${app^^} Installed"
-fi
-# shellcheck disable=SC2016
-append_to_bashrc_custom_if_missing '# Added by PMSS media stack installer (.NET 8)
+if media_stack_needs_dotnet && [[ -n "$SELECTED_APPS" && -x "$HOME/.bin/dotnet/dotnet" && $DRY_RUN -eq 0 ]]; then
+	# A partial install leaves other .NET apps running from this runtime; resetting it
+	# would pull the files out from under them.
+	log_info "Keeping the existing .NET runtime (shared with the other apps)"
+elif media_stack_needs_dotnet; then
+	# Install ASP.NET Core (.NET 8)
+	app="aspnetcore"
+	log_step "Installing ${app^^}..."
+	echo "Downloading...${app^^}"
+	installdir="$HOME/.bin/dotnet"
+	managed_install_path_reset "$installdir"
+	mkdir -p "$installdir"
+	cd "$installdir"
+	fetch_verified_archive "$ASPDOTNET_URL" "aspnetcore.tar.gz" "ASP.NET runtime"
+	if [[ $DRY_RUN -eq 0 && ! -f "aspnetcore.tar.gz" ]]; then
+		log_err "Failed to find downloaded ASP.NET archive"
+		exit 1
+	fi
+	extract_tgz "aspnetcore.tar.gz" "$installdir"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		echo "${app^^} Installed"
+	fi
+	# shellcheck disable=SC2016
+	append_to_bashrc_custom_if_missing '# Added by PMSS media stack installer (.NET 8)
 export DOTNET_ROOT=$HOME/.bin/dotnet
 case ":$PATH:" in
   *":$DOTNET_ROOT:"*) ;;
@@ -2542,27 +2836,36 @@ case ":$PATH:" in
   *) PATH="$PATH:$HOME/.bin" ;;
 esac
 export PATH' 'PMSS media stack installer'
-chmod 0640 "$HOME/.bashrc.custom" 2>/dev/null || true
-echo ""
-
-log_step "Configuring Servarr authentication..."
-if [[ $DRY_RUN -eq 0 ]]; then
-	servarr_auth_seed "radarr" "Radarr" "Radarr.dll" "$RADARR_PORT" "v3" "$RADARR_PASSWORD" "--nobrowser" || {
-		log_err "Radarr auth seeding failed; not starting media stack"
-		exit 1
-	}
-	servarr_auth_seed "prowlarr" "Prowlarr" "Prowlarr.dll" "$PROWLARR_PORT" "v1" "$PROWLARR_PASSWORD" "--nobrowser" || {
-		log_err "Prowlarr auth seeding failed; not starting media stack"
-		exit 1
-	}
-	servarr_auth_seed "sonarr" "Sonarr" "Sonarr.dll" "$SONARR_PORT" "v3" "$SONARR_PASSWORD" || {
-		log_err "Sonarr auth seeding failed; not starting media stack"
-		exit 1
-	}
-else
-	log_info "[dry-run] would seed Radarr/Sonarr/Prowlarr Forms auth on temporary loopback ports"
+	chmod 0640 "$HOME/.bashrc.custom" 2>/dev/null || true
 fi
 echo ""
+
+if app_selected radarr || app_selected prowlarr || app_selected sonarr; then
+	log_step "Configuring Servarr authentication..."
+	if [[ $DRY_RUN -eq 0 ]]; then
+		if app_selected radarr; then
+			servarr_auth_seed "radarr" "Radarr" "Radarr.dll" "$RADARR_PORT" "v3" "$RADARR_PASSWORD" "--nobrowser" || {
+				log_err "Radarr auth seeding failed; not starting media stack"
+				exit 1
+			}
+		fi
+		if app_selected prowlarr; then
+			servarr_auth_seed "prowlarr" "Prowlarr" "Prowlarr.dll" "$PROWLARR_PORT" "v1" "$PROWLARR_PASSWORD" "--nobrowser" || {
+				log_err "Prowlarr auth seeding failed; not starting media stack"
+				exit 1
+			}
+		fi
+		if app_selected sonarr; then
+			servarr_auth_seed "sonarr" "Sonarr" "Sonarr.dll" "$SONARR_PORT" "v3" "$SONARR_PASSWORD" || {
+				log_err "Sonarr auth seeding failed; not starting media stack"
+				exit 1
+			}
+		fi
+	else
+		log_info "[dry-run] would seed Forms auth for selected Servarr apps on temporary loopback ports"
+	fi
+	echo ""
+fi
 
 if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
 	# Install Jellyfin (URL, extract, no chmod)
@@ -2660,7 +2963,7 @@ SYSXML
 			exit 1
 		fi
 	fi
-else
+elif app_selected jellyfin; then
 	log_warn "Skipping Jellyfin install; rerun with --jellyfin-ffmpeg=$HOME/.bin/ffmpeg after installing FFmpeg ${JELLYFIN_MIN_FFMPEG_VERSION}+"
 fi
 echo ""
@@ -2707,10 +3010,6 @@ else
 fi
 
 echo ""
-if [[ $DRY_RUN -eq 0 ]]; then
-	media_stack_credentials_summary_print
-	echo ""
-fi
 echo "Connect to running application use command 'tmux attach -t <app-name>'"
 echo "e.g to attach to radarr 'tmux attach -t radarr'"
 echo "Exit tmux session by pressing 'CTRL+b' then 'd'"
@@ -2719,14 +3018,14 @@ echo "To start application manually use appname as command"
 echo "e.g for SONARR use 'sonarr'"
 echo ""
 for app in radarr sonarr prowlarr sabnzbd autobrr; do
-	echo "${app^^}-URL = https://${HOSTNAME}/public-${USERNAME}/${app}/"
+	app_selected "$app" && echo "${app^^}-URL = https://${HOSTNAME}/public-${USERNAME}/${app}/"
 done
 if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
 	echo "JELLYFIN-URL = https://${HOSTNAME}/public-${USERNAME}/jellyfin/web/"
 	echo "JELLYFIN-LOCAL-URL = http://127.0.0.1:${JELLYFIN_PORT}"
 	echo "JELLYFIN-MEDIA-PATH = $HOME/data"
 	echo "JELLYFIN-LIBRARY-GUIDANCE = Jellyfin cannot list /home on PMSS; type the full path above into the folder field instead of selecting /home."
-else
+elif app_selected jellyfin; then
 	echo "JELLYFIN-SKIPPED = install FFmpeg ${JELLYFIN_MIN_FFMPEG_VERSION}+ under ~/.bin and rerun with --jellyfin-ffmpeg=$HOME/.bin/ffmpeg"
 fi
 echo "PUBLIC-IP (do not expose ports): ${PUBLIC_IP}"
@@ -2743,26 +3042,13 @@ echo ""
 echo "To kill all applications use 'tmux kill-server'"
 
 echo ""
-log_step "Restarting lighttpd"
-if [[ $DRY_RUN -eq 0 ]]; then
-	pkill -9 -u "$USERNAME" lighttpd >/dev/null 2>&1 || true
-	pkill -9 -u "$USERNAME" php-cgi >/dev/null 2>&1 || true
-	if command -v lighttpd >/dev/null 2>&1 && [[ -f "$HOME/.lighttpd.conf" ]]; then
-		if ! lighttpd -f "$HOME/.lighttpd.conf" >/dev/null 2>&1; then
-			log_warn "Direct lighttpd restart failed; watchdog may retry."
-		fi
-	else
-		echo "It may take 1-2 minutes to restart lighttpd"
-	fi
-else
-	log_info "[dry-run] would restart lighttpd/php-cgi"
-fi
+media_stack_lighttpd_restart
 
 echo ""
 echo "================== SECURITY WARNING =================="
 if [[ "$JELLYFIN_INSTALL_ENABLED" -eq 1 ]]; then
 	echo "Jellyfin admin auth was configured before the public proxy was restarted."
-else
+elif app_selected jellyfin; then
 	echo "Jellyfin was skipped because FFmpeg ${JELLYFIN_MIN_FFMPEG_VERSION}+ is not configured."
 	echo "Install user-local FFmpeg and rerun with --jellyfin-ffmpeg=$HOME/.bin/ffmpeg."
 fi
@@ -2777,3 +3063,18 @@ echo "All services bind to localhost. Other accounts on this server can reach lo
 echo "For security: Use VPN/HTTPS only; do not forward ports publicly. Monitor for conflicts with /opt installs."
 echo "Report issues to support, but expect no hand-holding—DIY maintenance required."
 echo "Enjoy responsibly!"
+
+# Passwords go to the terminal only: stdout is tee'd into ~/.install-media-stack.log,
+# whose tail the web panel displays.
+if [[ $DRY_RUN -eq 0 ]]; then
+	echo ""
+	if [[ $MEDIA_STACK_INTERACTIVE -eq 1 ]] && { : >/dev/tty; } 2>/dev/null; then
+		{
+			echo "===================== LOGIN DATA ====================="
+			media_stack_credentials_summary_print
+			echo "======================================================="
+		} >/dev/tty
+	else
+		echo "Login data: $MEDIA_STACK_CREDENTIALS_FILE"
+	fi
+fi

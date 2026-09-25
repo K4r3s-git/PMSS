@@ -699,7 +699,7 @@ BASH
 
     public function testJellyfinFfmpegPreflightRunsBeforeDataLossPrompt(): void
     {
-        $preflight = strpos($this->script, "\n\tjellyfin_ffmpeg_configure_fallback\n");
+        $preflight = strpos($this->script, "\n\tif [[ \"\$JELLYFIN_INSTALL_ENABLED\" -eq 1 ]]; then\n\t\tjellyfin_ffmpeg_configure_fallback\n");
         $prompt = strpos($this->script, 'WARNING: %s exists and will be removed');
 
         $this->assertTrue($preflight !== false, 'Jellyfin FFmpeg pre-flight call missing');
@@ -902,6 +902,9 @@ LIGHTTPD;
         $this->pmssEnsureDir($home.'/.lighttpd/custom.d');
 
         $functions = $this->pmssExtractShellFunctions($this->script, array(
+            'app_selected',
+            'media_stack_app_bin_dir',
+            'app_active',
             'lighttpd_media_stack_proxy_block_write',
             'lighttpd_media_stack_config_write',
         ));
@@ -912,6 +915,7 @@ LIGHTTPD;
             'USERNAME=alice',
             'SABNZBD_PORT=18080 RADARR_PORT=17878 PROWLARR_PORT=19696 SONARR_PORT=18989 AUTOBRR_PORT=17474 JELLYFIN_PORT=18096',
             'JELLYFIN_INSTALL_ENABLED=1',
+            'SELECTED_APPS="sonarr radarr prowlarr sabnzbd autobrr jellyfin cloudplow"',
             $functions,
             'lighttpd_media_stack_config_write "$HOME/.lighttpd/custom.d/media-stack.conf"',
             'JELLYFIN_INSTALL_ENABLED=0',
@@ -1406,6 +1410,61 @@ BASH
             'WARN:Detected GLIBC 2.31 < 2.33',
             'url=https://github.com/Radarr/Radarr/releases/download/v5.10.4.9218/Radarr.master.5.10.4.9218.linux-core-x64.tar.gz',
         ], $output);
+    }
+
+    public function testPerAppStopEndsOnlyThePaneProcessGroup(): void
+    {
+        $home = $this->pmssMakeTempDir('pmss-media-stack-app-stop-');
+        $trace = $home.'/trace.log';
+        $functions = $this->pmssExtractShellFunctions($this->script, array('media_stack_app_stop'));
+        // No `pkill -f` here: the pattern would also match the installer's own argv
+        // (--apps=sabnzbd) and the tmux server. The pane PID is read before the session goes.
+        $script = implode("\n", array(
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            'TRACE='.escapeshellarg($trace),
+            'media_stack_session_owned() { [[ "$1" != foreign ]]; }',
+            'media_stack_session_kill_owned() { echo "session-kill:$1" >> "$TRACE"; }',
+            'tmux() { [[ "$*" == "list-panes -t =$APP -F #{pane_pid}" ]] && echo "$PANE"; return 0; }',
+            'kill() { echo "kill:$*" >> "$TRACE"; }',
+            'sleep() { :; }',
+            $functions,
+            'APP=sabnzbd PANE=43001; media_stack_app_stop sabnzbd',
+            'APP=foreign PANE=43002; media_stack_app_stop foreign',
+            'APP=radarr PANE=1; media_stack_app_stop radarr',
+            'APP=sonarr PANE=$$; media_stack_app_stop sonarr',
+            'echo completed',
+            '',
+        ));
+
+        $output = $this->pmssRunShellHarness($script);
+        $this->assertStringContainsString('completed', $output);
+        $this->assertSame(
+            "session-kill:sabnzbd\nkill:-TERM -- -43001\nkill:-KILL -- -43001\nsession-kill:radarr\nsession-kill:sonarr\n",
+            (string) file_get_contents($trace)
+        );
+    }
+
+    public function testAutobrrStartCommandKeepsItsLineContinuation(): void
+    {
+        // A blank line after the trailing backslash ends the command, and the "not found"
+        // message then runs as a program (exit 127) for every --apps= selection.
+        $this->assertSame(1, preg_match(
+            '/app_selected autobrr && media_stack_start_tmux_app "autobrr"[^\n]*\\\\\n[^\n]*\\\\\n\t\t"Autobrr not found/',
+            $this->script
+        ));
+    }
+
+    public function testPartialInstallKeepsTheSharedDotnetRuntime(): void
+    {
+        $this->assertStringContainsString(
+            'if media_stack_needs_dotnet && [[ -n "$SELECTED_APPS" && -x "$HOME/.bin/dotnet/dotnet" && $DRY_RUN -eq 0 ]]; then',
+            $this->script
+        );
+        $this->assertStringContainsString('Keeping the existing .NET runtime', $this->script);
+        $uninstall = $this->pmssExtractShellFunctions($this->script, array('media_stack_uninstall_apps'));
+        $this->assertStringContainsString('media_stack_app_stop "$app"', $uninstall);
+        $this->assertStringNotContainsString('pkill', $uninstall);
     }
 
     public function testAppProcessKillPreservesTmuxShellAndDryRun(): void
