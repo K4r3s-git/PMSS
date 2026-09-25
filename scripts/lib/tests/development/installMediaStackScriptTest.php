@@ -229,7 +229,7 @@ class installMediaStackScriptTest extends TestCase
     {
         $this->assertStringContainsAllStrings([
             'servarr_auth_seed() {',
-            'base_url="http://127.0.0.1:${seed_port}/api/${api_version}/config/host"',
+            'base_url="http://127.0.0.1:${seed_port}$(sed -n -E \'s|.*<UrlBase>([^<]*)</UrlBase>.*|\\1|p\' "$config_file" 2>/dev/null | head -n 1 | sed \'s|/$||\')/api/${api_version}/config/host"',
             '$data["authenticationMethod"] = "forms"',
             '$data["authenticationRequired"] = "enabled"',
             'servarr_credentials_mark_existing_unknown() {',
@@ -466,7 +466,7 @@ BASH
 
     public function testJellyfinFfmpegPreflightRunsBeforeDataLossPrompt(): void
     {
-        $preflight = strpos($this->script, "\n\tjellyfin_ffmpeg_configure_fallback\n");
+        $preflight = strpos($this->script, "\n\tif [[ \"\$JELLYFIN_INSTALL_ENABLED\" -eq 1 ]]; then\n\t\tjellyfin_ffmpeg_configure_fallback\n");
         $prompt = strpos($this->script, 'WARNING: %s exists and will be removed');
 
         $this->assertTrue($preflight !== false, 'Jellyfin FFmpeg pre-flight call missing');
@@ -648,6 +648,9 @@ LIGHTTPD;
         $this->pmssEnsureDir($home.'/.lighttpd/custom.d');
 
         $functions = $this->pmssExtractShellFunctions($this->script, array(
+            'app_selected',
+            'media_stack_app_bin_dir',
+            'app_active',
             'lighttpd_media_stack_proxy_block_write',
             'lighttpd_media_stack_config_write',
         ));
@@ -658,6 +661,7 @@ LIGHTTPD;
             'USERNAME=alice',
             'SABNZBD_PORT=18080 RADARR_PORT=17878 PROWLARR_PORT=19696 SONARR_PORT=18989 AUTOBRR_PORT=17474 JELLYFIN_PORT=18096',
             'JELLYFIN_INSTALL_ENABLED=1',
+            'SELECTED_APPS="sonarr radarr prowlarr sabnzbd autobrr jellyfin cloudplow"',
             $functions,
             'lighttpd_media_stack_config_write "$HOME/.lighttpd/custom.d/media-stack.conf"',
             'JELLYFIN_INSTALL_ENABLED=0',
